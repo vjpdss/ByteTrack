@@ -14,6 +14,10 @@ from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
 from yolox.tracking_utils.timer import Timer
 
+import sys
+sys.path.append("C:\\Users\\victo\\Projects\\darknet\\")
+import darknet
+import numpy as np
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -87,6 +91,11 @@ def make_parser():
     )
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+
+    parser.add_argument("--weights", default="yolov4.weights", help="yolo weights path")
+    parser.add_argument("--config_file", default="./cfg/yolov4.cfg", help="path to config file")
+    parser.add_argument("--data_file", default="./cfg/coco.data", help="path to data file")
+    parser.add_argument("--thresh", type=float, default=.25, help="remove detections with confidence below this value")
     return parser
 
 
@@ -113,6 +122,52 @@ def write_results(filename, results):
                 f.write(line)
     logger.info('save results to {}'.format(filename))
 
+
+class Darknet_Predictor(object):
+    def __init__(
+        self,
+        cfg,
+        data,
+        weights,
+        thresh=0.05,
+        batch_size=1,
+    ):
+        self.network, self.class_names, self.class_colors = darknet.load_network(
+            cfg,
+            data,
+            weights,
+            batch_size=batch_size
+        )
+        self.threshold = thresh
+        self.width = darknet.network_width(self.network)
+        self.height = darknet.network_height(self.network)
+        self.batch_size = batch_size
+
+    def predict(self, frame, timer):
+        raw_img = frame.copy()
+        frame_rgb = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+        frame_resized = cv2.resize(frame_rgb, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        img_for_detect = darknet.make_image(self.width, self.height, 3)
+        darknet.copy_image_from_bytes(img_for_detect, frame_resized.tobytes())
+        
+        timer.tic()
+        darknet_outputs = darknet.detect_image(self.network, self.class_names, img_for_detect, self.threshold)
+        darknet.free_image(img_for_detect)
+        
+        # outputs must be a N_detections x 5 array/tensor (xleft, ytop, xright, ybottom, confidence)
+        outputs = [
+            [   float(dout[2][0]) - float(dout[2][2])/2.0,  #xleft
+                float(dout[2][1]) - float(dout[2][3])/2.0,  #ytop
+                float(dout[2][0]) + float(dout[2][2])/2.0,  #xright
+                float(dout[2][1]) + float(dout[2][3])/2.0,  #ybottom
+                float(dout[1])/100.0,                       #confidence
+                self.class_names.index(dout[0]),            #class_id
+            ] for dout in darknet_outputs]
+        outputs = np.array(outputs)
+        #sort outputs by last column
+        outputs = outputs[np.argsort(-outputs[:,4])]
+
+        return outputs     
 
 class Predictor(object):
     def __init__(
@@ -258,12 +313,20 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
-            outputs, img_info = predictor.inference(frame, timer)
-            if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+            
+            darknet_raw_img = frame.copy()
+            
+            outputs = predictor.predict(darknet_raw_img, timer)
+            
+            if outputs is not None:
+                #online_targets = tracker.update(outputs, [darknet_height, darknet_width], exp.test_size)
+                frame_height, frame_width = frame.shape[0], frame.shape[1]
+                online_targets = tracker.update(outputs, [frame_height, frame_width], [predictor.height, predictor.width])
+                
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
+                online_classes = []
                 for t in online_targets:
                     tlwh = t.tlwh
                     tid = t.track_id
@@ -272,16 +335,17 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                         online_tlwhs.append(tlwh)
                         online_ids.append(tid)
                         online_scores.append(t.score)
+                        online_classes.append(t.class_id)
                         results.append(
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
                 timer.toc()
                 online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
+                    darknet_raw_img, online_tlwhs, online_ids, class_ids=online_classes, frame_id=frame_id + 1, fps=1. / timer.average_time
                 )
             else:
                 timer.toc()
-                online_im = img_info['raw_img']
+                online_im = darknet_raw_img
             if args.save_result:
                 vid_writer.write(online_im)
             ch = cv2.waitKey(1)
@@ -357,7 +421,7 @@ def main(exp, args):
         trt_file = None
         decoder = None
 
-    predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
+    predictor = Darknet_Predictor(args.config_file, args.data_file, args.weights)
     current_time = time.localtime()
     if args.demo == "image":
         image_demo(predictor, vis_folder, current_time, args)
