@@ -7,20 +7,24 @@ import torch
 
 from loguru import logger
 
-from yolox.data.data_augment import preproc
-from yolox.exp import get_exp
-from yolox.utils import fuse_model, get_model_info, postprocess
 from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
 from yolox.tracking_utils.timer import Timer
 
+
 import sys
-sys.path.append("C:\\Users\\victo\\Projects\\darknet\\")
+DARKNET_PATH = "/absolute/path/to/darknet"
+sys.path.append(DARKNET_PATH)
+assert os.path.exists(DARKNET_PATH), "Please set the correct path to darknet directory"
+
 import darknet
 import numpy as np
+import datetime
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
-
+COLOR_BLUE = (255, 0, 0)
+COLOR_GREEN = (0, 255, 0)
+COLOR_RED = (0, 0, 255)
 
 def make_parser():
     parser = argparse.ArgumentParser("ByteTrack Demo!")
@@ -41,46 +45,13 @@ def make_parser():
         help="whether to save the inference result of image/video",
     )
 
-    # exp file
-    parser.add_argument(
-        "-f",
-        "--exp_file",
-        default=None,
-        type=str,
-        help="pls input your expriment description file",
-    )
-    parser.add_argument("-c", "--ckpt", default=None, type=str, help="ckpt for eval")
     parser.add_argument(
         "--device",
         default="gpu",
         type=str,
         help="device to run our model, can either be cpu or gpu",
     )
-    parser.add_argument("--conf", default=None, type=float, help="test conf")
-    parser.add_argument("--nms", default=None, type=float, help="test nms threshold")
-    parser.add_argument("--tsize", default=None, type=int, help="test img size")
-    parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
-    parser.add_argument(
-        "--fp16",
-        dest="fp16",
-        default=False,
-        action="store_true",
-        help="Adopting mix precision evaluating.",
-    )
-    parser.add_argument(
-        "--fuse",
-        dest="fuse",
-        default=False,
-        action="store_true",
-        help="Fuse conv and bn for testing.",
-    )
-    parser.add_argument(
-        "--trt",
-        dest="trt",
-        default=False,
-        action="store_true",
-        help="Using TensorRT model for testing.",
-    )
+    parser.add_argument("--output_dir", default=".\\", type=str, help="output dir")
     # tracking args
     parser.add_argument("--track_thresh", type=float, default=0.5, help="tracking confidence threshold")
     parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
@@ -89,7 +60,7 @@ def make_parser():
         "--aspect_ratio_thresh", type=float, default=1.6,
         help="threshold for filtering out boxes of which aspect ratio are above the given value."
     )
-    parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
+    parser.add_argument('--min_box_area', type=float, default=1, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
 
     parser.add_argument("--weights", default="yolov4.weights", help="yolo weights path")
@@ -154,81 +125,22 @@ class Darknet_Predictor(object):
         darknet_outputs = darknet.detect_image(self.network, self.class_names, img_for_detect, self.threshold)
         darknet.free_image(img_for_detect)
         
-        # outputs must be a N_detections x 5 array/tensor (xleft, ytop, xright, ybottom, confidence)
-        outputs = [
-            [   float(dout[2][0]) - float(dout[2][2])/2.0,  #xleft
-                float(dout[2][1]) - float(dout[2][3])/2.0,  #ytop
-                float(dout[2][0]) + float(dout[2][2])/2.0,  #xright
-                float(dout[2][1]) + float(dout[2][3])/2.0,  #ybottom
-                float(dout[1])/100.0,                       #confidence
-                self.class_names.index(dout[0]),            #class_id
-            ] for dout in darknet_outputs]
-        outputs = np.array(outputs)
-        #sort outputs by last column
-        outputs = outputs[np.argsort(-outputs[:,4])]
-
-        return outputs     
-
-class Predictor(object):
-    def __init__(
-        self,
-        model,
-        exp,
-        trt_file=None,
-        decoder=None,
-        device=torch.device("cpu"),
-        fp16=False
-    ):
-        self.model = model
-        self.decoder = decoder
-        self.num_classes = exp.num_classes
-        self.confthre = exp.test_conf
-        self.nmsthre = exp.nmsthre
-        self.test_size = exp.test_size
-        self.device = device
-        self.fp16 = fp16
-        if trt_file is not None:
-            from torch2trt import TRTModule
-
-            model_trt = TRTModule()
-            model_trt.load_state_dict(torch.load(trt_file))
-
-            x = torch.ones((1, 3, exp.test_size[0], exp.test_size[1]), device=device)
-            self.model(x)
-            self.model = model_trt
-        self.rgb_means = (0.485, 0.456, 0.406)
-        self.std = (0.229, 0.224, 0.225)
-
-    def inference(self, img, timer):
-        img_info = {"id": 0}
-        if isinstance(img, str):
-            img_info["file_name"] = osp.basename(img)
-            img = cv2.imread(img)
+        if len(darknet_outputs) > 0:
+            # outputs must be a N_detections x 5 array/tensor (xleft, ytop, xright, ybottom, confidence)
+            outputs = [
+                [   float(dout[2][0]) - float(dout[2][2])/2.0,  #xleft
+                    float(dout[2][1]) - float(dout[2][3])/2.0,  #ytop
+                    float(dout[2][0]) + float(dout[2][2])/2.0,  #xright
+                    float(dout[2][1]) + float(dout[2][3])/2.0,  #ybottom
+                    float(dout[1])/100.0,                       #confidence
+                    self.class_names.index(dout[0]),            #class_id
+                ] for dout in darknet_outputs]
+            outputs = np.array(outputs)
+            #sort outputs by last column
+            outputs = outputs[np.argsort(-outputs[:,4])]
         else:
-            img_info["file_name"] = None
-
-        height, width = img.shape[:2]
-        img_info["height"] = height
-        img_info["width"] = width
-        img_info["raw_img"] = img
-
-        img, ratio = preproc(img, self.test_size, self.rgb_means, self.std)
-        img_info["ratio"] = ratio
-        img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
-        if self.fp16:
-            img = img.half()  # to FP16
-
-        with torch.no_grad():
-            timer.tic()
-            outputs = self.model(img)
-            if self.decoder is not None:
-                outputs = self.decoder(outputs, dtype=outputs.type())
-            outputs = postprocess(
-                outputs, self.num_classes, self.confthre, self.nmsthre
-            )
-            #logger.info("Infer time: {:.4f}s".format(time.time() - t0))
-        return outputs, img_info
-
+            outputs = None
+        return outputs     
 
 def image_demo(predictor, vis_folder, current_time, args):
     if osp.isdir(args.path):
@@ -236,36 +148,76 @@ def image_demo(predictor, vis_folder, current_time, args):
     else:
         files = [args.path]
     files.sort()
-    tracker = BYTETracker(args, frame_rate=args.fps)
+    trackers = []
+    for class_id, class_name in enumerate(predictor.class_names):
+        trackers.append(
+            BYTETracker(args, frame_rate=args.fps)
+        )
+    #tracker = BYTETracker(args, frame_rate=args.fps)
     timer = Timer()
     results = []
 
     for frame_id, img_path in enumerate(files, 1):
-        outputs, img_info = predictor.inference(img_path, timer)
-        if outputs[0] is not None:
-            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+        img = cv2.imread(img_path)
+        img_height, img_width = img.shape[:2]
+
+        outputs_total = predictor.predict(img, timer)
+        if outputs_total is not None:
             online_tlwhs = []
             online_ids = []
             online_scores = []
-            for t in online_targets:
-                tlwh = t.tlwh
-                tid = t.track_id
-                vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
-                if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
-                    online_tlwhs.append(tlwh)
-                    online_ids.append(tid)
-                    online_scores.append(t.score)
-                    # save results
-                    results.append(
-                        f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                    )
+            online_classes = []
+
+            online_tlwhs_not_active = []
+            online_ids_not_active = []
+            online_scores_not_active = []
+            online_classes_not_active = []
+
+
+            for tracker_id, tracker in enumerate(trackers):
+
+                # Get rows in outputs total with class_id == tracker_id
+                outputs = outputs_total[outputs_total[:, -1].astype(int) == tracker_id]
+                online_targets, online_targets_not_active = tracker.update(outputs, [img_height, img_width], [predictor.height, predictor.width])
+                for t in online_targets:
+                    tlwh = t.tlwh
+                    tid = t.track_id
+                    vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                    if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                        online_tlwhs.append(tlwh)
+                        online_ids.append(tid)
+                        online_scores.append(t.score)
+                        online_classes.append(t.class_id)
+                        # save results
+                        results.append(
+                            f"{frame_id},{tid},{t.class_id},{int(t.is_activated)},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f}\n"
+                        )
+                for t in online_targets_not_active:
+                    tlwh = t.tlwh
+                    tid = t.track_id
+                    vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                    if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                        online_tlwhs_not_active.append(tlwh)
+                        online_ids_not_active.append(tid)
+                        online_scores_not_active.append(t.score)
+                        online_classes_not_active.append(t.class_id)
+                        # save results
+                        results.append(
+                            f"{frame_id},{tid},{t.class_id},{int(t.is_activated)},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f}\n"
+                        )
             timer.toc()
+
+            active_color = [COLOR_GREEN if t.class_id == 0 else COLOR_BLUE for t in online_targets]
             online_im = plot_tracking(
-                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
+                img, online_tlwhs, online_ids, class_ids=online_classes, colors=active_color, frame_id=frame_id + 1, fps=1. / timer.average_time
+            )
+            not_active_color = [COLOR_RED]*len(online_tlwhs_not_active)
+            online_im = plot_tracking(
+                online_im, online_tlwhs_not_active, online_ids_not_active, class_ids=online_classes_not_active, colors=not_active_color, frame_id=frame_id + 1, fps=1. / timer.average_time
             )
         else:
             timer.toc()
-            online_im = img_info['raw_img']
+            online_im = img
 
         # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if args.save_result:
@@ -293,55 +245,96 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
     fps = cap.get(cv2.CAP_PROP_FPS)
+    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    # print video info (width, height, fps, frames)
+    logger.info(f"video info: {width} x {height} @ {fps} FPS, {frames} frames")
     timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
     save_folder = osp.join(vis_folder, timestamp)
     os.makedirs(save_folder, exist_ok=True)
     if args.demo == "video":
-        save_path = osp.join(save_folder, args.path.split("/")[-1])
+        save_path = osp.join(save_folder, args.path.split(os.sep)[-1])
     else:
         save_path = osp.join(save_folder, "camera.mp4")
     logger.info(f"video save_path is {save_path}")
     vid_writer = cv2.VideoWriter(
         save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
     )
-    tracker = BYTETracker(args, frame_rate=30)
+    trackers = []
+
+    # We will track different objects with different trackers.
+    for class_id, class_name in enumerate(predictor.class_names):
+        trackers.append(BYTETracker(args, frame_rate=fps))
+
+    #tracker = BYTETracker(args, frame_rate=30)
+    
     timer = Timer()
     frame_id = 0
     results = []
     while True:
-        if frame_id % 20 == 0:
-            logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
+        if (frame_id + 1) % 20 == 0:
+            time_eta = (frames - (frame_id + 1)) * timer.average_time
+            time_eta_hhmmss = str(datetime.timedelta(seconds=time_eta))
+            logger.info('Processing frame {} ({:.2%}) ({:.2f} fps) ETA: {}'.format(frame_id + 1, (frame_id + 1) / frames, 1. / max(1e-5, timer.average_time), time_eta_hhmmss))
+            timer.clear()
         ret_val, frame = cap.read()
         if ret_val:
             
             darknet_raw_img = frame.copy()
             
-            outputs = predictor.predict(darknet_raw_img, timer)
+            outputs_total = predictor.predict(darknet_raw_img, timer)
             
-            if outputs is not None:
-                #online_targets = tracker.update(outputs, [darknet_height, darknet_width], exp.test_size)
+            if outputs_total is not None:
                 frame_height, frame_width = frame.shape[0], frame.shape[1]
-                online_targets = tracker.update(outputs, [frame_height, frame_width], [predictor.height, predictor.width])
-                
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
                 online_classes = []
-                for t in online_targets:
-                    tlwh = t.tlwh
-                    tid = t.track_id
-                    vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
-                    if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
-                        online_tlwhs.append(tlwh)
-                        online_ids.append(tid)
-                        online_scores.append(t.score)
-                        online_classes.append(t.class_id)
-                        results.append(
-                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                        )
+
+                online_tlwhs_not_active = []
+                online_ids_not_active = []
+                online_scores_not_active = []
+                online_classes_not_active = []
+
+                for tracker_id, tracker in enumerate(trackers):
+                    # Get rows in outputs total with class_id == tracker_id
+                    outputs = outputs_total[outputs_total[:, -1].astype(int) == tracker_id]
+
+                    online_targets, online_targets_not_active = tracker.update(outputs, [frame_height, frame_width], [predictor.height, predictor.width])
+                    for t in online_targets:
+                        tlwh = t.tlwh
+                        tid = t.track_id
+                        vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                        if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                            online_tlwhs.append(tlwh)
+                            online_ids.append(tid)
+                            online_scores.append(t.score)
+                            online_classes.append(t.class_id)
+                            results.append(
+                                #f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                                f"{frame_id},{tid},{t.class_id},{int(t.is_activated)},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f}\n"
+                            )
+                    for t in online_targets_not_active:
+                        tlwh = t.tlwh
+                        tid = t.track_id
+                        vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                        if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                            online_tlwhs_not_active.append(tlwh)
+                            online_ids_not_active.append(tid)
+                            online_scores_not_active.append(t.score)
+                            online_classes_not_active.append(t.class_id)
+                            # save results
+                            results.append(
+                                f"{frame_id},{tid},{t.class_id},{int(t.is_activated)},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f}\n"
+                            )
+
                 timer.toc()
+                active_color = [COLOR_GREEN if cc == 0 else COLOR_BLUE for cc in online_classes]
                 online_im = plot_tracking(
-                    darknet_raw_img, online_tlwhs, online_ids, class_ids=online_classes, frame_id=frame_id + 1, fps=1. / timer.average_time
+                    darknet_raw_img, online_tlwhs, online_ids, class_ids=online_classes, colors=active_color, frame_id=frame_id + 1, fps=1. / timer.average_time
+                )
+                not_active_color = [COLOR_RED]*len(online_tlwhs_not_active)
+                online_im = plot_tracking(
+                    online_im, online_tlwhs_not_active, online_ids_not_active, class_ids=online_classes_not_active, colors=not_active_color, frame_id=frame_id + 1, fps=1. / timer.average_time
                 )
             else:
                 timer.toc()
@@ -362,67 +355,22 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         logger.info(f"save results to {res_file}")
 
 
-def main(exp, args):
-    if not args.experiment_name:
-        args.experiment_name = exp.exp_name
-
-    output_dir = osp.join(exp.output_dir, args.experiment_name)
+def main(args):
+    
+    output_dir = osp.join(args.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)
 
     if args.save_result:
         vis_folder = osp.join(output_dir, "track_vis")
         os.makedirs(vis_folder, exist_ok=True)
 
-    if args.trt:
-        args.device = "gpu"
     args.device = torch.device("cuda" if args.device == "gpu" else "cpu")
 
     logger.info("Args: {}".format(args))
 
-    if args.conf is not None:
-        exp.test_conf = args.conf
-    if args.nms is not None:
-        exp.nmsthre = args.nms
-    if args.tsize is not None:
-        exp.test_size = (args.tsize, args.tsize)
-
-    model = exp.get_model().to(args.device)
-    logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
-    model.eval()
-
-    if not args.trt:
-        if args.ckpt is None:
-            ckpt_file = osp.join(output_dir, "best_ckpt.pth.tar")
-        else:
-            ckpt_file = args.ckpt
-        logger.info("loading checkpoint")
-        ckpt = torch.load(ckpt_file, map_location="cpu")
-        # load the model state dict
-        model.load_state_dict(ckpt["model"])
-        logger.info("loaded checkpoint done.")
-
-    if args.fuse:
-        logger.info("\tFusing model...")
-        model = fuse_model(model)
-
-    if args.fp16:
-        model = model.half()  # to FP16
-
-    if args.trt:
-        assert not args.fuse, "TensorRT model is not support model fusing!"
-        trt_file = osp.join(output_dir, "model_trt.pth")
-        assert osp.exists(
-            trt_file
-        ), "TensorRT model is not found!\n Run python3 tools/trt.py first!"
-        model.head.decode_in_inference = False
-        decoder = model.head.decode_outputs
-        logger.info("Using TensorRT to inference")
-    else:
-        trt_file = None
-        decoder = None
-
     predictor = Darknet_Predictor(args.config_file, args.data_file, args.weights)
     current_time = time.localtime()
+    
     if args.demo == "image":
         image_demo(predictor, vis_folder, current_time, args)
     elif args.demo == "video" or args.demo == "webcam":
@@ -431,6 +379,5 @@ def main(exp, args):
 
 if __name__ == "__main__":
     args = make_parser().parse_args()
-    exp = get_exp(args.exp_file, args.name)
 
-    main(exp, args)
+    main(args)
