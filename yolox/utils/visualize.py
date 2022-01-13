@@ -49,7 +49,7 @@ def get_color(idx):
     return color
 
 
-def plot_tracking(image, tlwhs, obj_ids, scores=None, class_ids=None, colors=None, frame_id=0, fps=0., ids2=None):
+def plot_tracking(image, tlwhs, obj_ids, scores=None, class_ids=None, colors=None, frame_id=0, fps=0., ids2=None, info={}):
     im = np.ascontiguousarray(np.copy(image))
     im_h, im_w = im.shape[:2]
 
@@ -63,8 +63,12 @@ def plot_tracking(image, tlwhs, obj_ids, scores=None, class_ids=None, colors=Non
     line_thickness = 3
 
     radius = max(5, int(im_w/140.))
-    cv2.putText(im, 'frame: %d fps: %.2f num: %d' % (frame_id, fps, len(tlwhs)),
-                (0, int(15 * text_scale)), cv2.FONT_HERSHEY_PLAIN, 2, (0, 0, 255), thickness=2)
+    
+    text_info = ''
+    for k,v in info.items():
+        text_info += '{}: {}. '.format(k, v)
+    if len(text_info) > 0:
+        cv2.putText(im, text_info, (0, int(15 * (text_scale + 2))), cv2.FONT_HERSHEY_PLAIN, text_scale+1, (0,255,0), thickness=text_thickness+1)
 
     for i, tlwh in enumerate(tlwhs):
         x1, y1, w, h = tlwh
@@ -85,6 +89,32 @@ def plot_tracking(image, tlwhs, obj_ids, scores=None, class_ids=None, colors=Non
                     thickness=text_thickness)
     return im
 
+def plot_detections(image, detections, colors=None, fill=False, alpha = 0.5):
+    im = np.ascontiguousarray(np.copy(image))
+
+    for obj_id, det in enumerate(detections):
+        xl, yt, xr, yb = det[:4]
+        intbox = tuple(map(int, (xl, yt, xr, yb)))
+
+        if colors is not None and len(colors) == len(detections):
+            color = colors[obj_id]
+        else:
+            color = get_color(obj_id)
+
+        cv2.rectangle(im, intbox[0:2], intbox[2:4], color=color, thickness=1)
+        text = '{}[{:.2%}]'.format(int(det[5]),det[4])
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        txt_size = cv2.getTextSize(text, font, 0.8, 2)[0]
+        cv2.putText(im, text, (intbox[0], intbox[3]+2*txt_size[1]), font, 0.8, color, thickness=2)
+
+        if fill:
+            sub_img = im[intbox[1]:intbox[3], intbox[0]:intbox[2]]
+            bbox_fill = np.empty(sub_img.shape, dtype=sub_img.dtype)
+            bbox_fill[:] = color
+            #print(im.shape, intbox, bbox_fill.shape, sub_img.shape)
+            im[intbox[1]:intbox[3], intbox[0]:intbox[2]] = cv2.addWeighted(sub_img, alpha, bbox_fill, 1 - alpha, 0)
+
+    return im
 
 _COLORS = np.array(
     [

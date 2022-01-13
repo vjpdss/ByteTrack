@@ -296,8 +296,9 @@ class BYTETracker(object):
         # get scores of lost tracks
         output_stracks = [track for track in self.tracked_stracks if track.is_activated]
         output_stracks_not_active = [track for track in self.tracked_stracks if not track.is_activated]
+        output_lost_stracks = [track for track in self.lost_stracks]
 
-        return output_stracks, output_stracks_not_active
+        return output_stracks, output_stracks_not_active, output_lost_stracks
 
 
 def joint_stracks(tlista, tlistb):
